@@ -11,12 +11,12 @@ package plin
 // C: LPSTR  -> char* (C string)
 // We'll model LPSTR as uintptr for now (pointer-sized). You can change to *C.char in cgo builds.
 
-type BYTE = uint8
-type WORD = uint16
-type DWORD = uint32
-type SDWORD = int32
-type UINT64 = uint64
-type LPSTR = uintptr // or *C.char in a cgo context
+type BYTE uint8
+type WORD uint16
+type DWORD uint32
+type SDWORD int32
+type UINT64 uint64
+type LPSTR *byte // or *C.char in a cgo context
 
 // -----------------------------------------------------------------------------
 // Type definitions from header typedefs
@@ -35,7 +35,6 @@ type TLINHardwareMode uint8       // Hardware Operation Modes
 type TLINHardwareState uint8      // Hardware Status
 type TLINScheduleState uint8      // Schedule Status
 type TLINError int32             // Error Codes
-
 
 /////////////////////////////////////////////////////////////
 // Value definitions

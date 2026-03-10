@@ -1,10 +1,11 @@
 package plin
 
 import (
-	"log"
 	"sync"
 	"syscall"
 	"unsafe"
+	"bytes"
+	"fmt"
 )
 
 var (
@@ -14,8 +15,8 @@ var (
 		"LIN_SetResponseRemap": &procLINSetResponseRemap,
 		"LIN_GetTargetTime": &procLINGetTargetTime,
 		"LIN_GetPID": &procLINGetPID,
-		"LIN_GetErrorText": &procLINGetErrorText, //review
-		"LIN_GetVersionInfo": &procLINGetVersionInfo, //review
+		"LIN_GetErrorText": &procLINGetErrorText, 
+		"LIN_GetVersionInfo": &procLINGetVersionInfo,
 		"LIN_GetVersion": &procLINGetVersion,
 		"LIN_CalculateChecksum": &procLINCalculateChecksum,
 		"LIN_GetStatus": &procLINGetStatus,
@@ -39,22 +40,22 @@ var (
 		"LIN_IdentifyHardware": &procLINIdentifyHardware,
 		"LIN_ResetHardwareConfig": &procLINResetHardwareConfig,
 		"LIN_ResetHardware": &procLINResetHardware,
-		"LIN_GetHardwareParam": &procLINGetHardwareParam //review
-		"LIN_SetHardwareParam": &procLINSetHardwareParam //review
+		"LIN_GetHardwareParam": &procLINGetHardwareParam,
+		"LIN_SetHardwareParam": &procLINSetHardwareParam,
 		"LIN_GetAvailableHardware": &procLINGetAvailableHardware,
-		"LIN_InitializeHardware": &procLINInitializeHardware, //review BYTE
+		"LIN_InitializeHardware": &procLINInitializeHardware,
 		"LIN_Write": &procLINWrite,
 		"LIN_ReadMulti": &procLINReadMulti,
 		"LIN_Read": &procLINRead,
-		"LIN_GetClientFilter", &procLINGetClientFilter,
-		"LIN_SetClientFilter", &procLINSetClientFilter,
-		"LIN_GetClientParam", &procLINGetClientParam, //review BYTE
-		"LIN_SetClientParam", &procLINSetClientParam, //review BYTE
-		"LIN_ResetClient", &procLINResetClient,
-		"LIN_DisconnectClient", &procLINDisconnectClient,
-		"LIN_ConnectClient", &procLINConnectClient,
-		"LIN_RemoveClient", &procLINRemoveClient,
-		"LIN_RegisterClient", &procLINRegisterClient,
+		"LIN_GetClientFilter": &procLINGetClientFilter,
+		"LIN_SetClientFilter": &procLINSetClientFilter,
+		"LIN_GetClientParam": &procLINGetClientParam,
+		"LIN_SetClientParam": &procLINSetClientParam,
+		"LIN_ResetClient": &procLINResetClient,
+		"LIN_DisconnectClient": &procLINDisconnectClient,
+		"LIN_ConnectClient": &procLINConnectClient,
+		"LIN_RemoveClient": &procLINRemoveClient,
+		"LIN_RegisterClient": &procLINRegisterClient,
 	}
 
 	plin                  *syscall.DLL
@@ -90,7 +91,7 @@ var (
 	procLINResetHardware *syscall.Proc
 	procLINGetHardwareParam *syscall.Proc
 	procLINSetHardwareParam *syscall.Proc
-	procGetAvailableHardware *syscall.Proc
+	procLINGetAvailableHardware *syscall.Proc
 	procLINInitializeHardware *syscall.Proc
 	procLINWrite *syscall.Proc
 	procLINReadMulti *syscall.Proc
@@ -99,7 +100,7 @@ var (
 	procLINSetClientFilter *syscall.Proc
 	procLINGetClientParam *syscall.Proc
 	procLINSetClientParam *syscall.Proc
-	procprocLINResetClient *syscall.Proc
+	procLINResetClient *syscall.Proc
  	procLINDisconnectClient *syscall.Proc
 	procLINConnectClient *syscall.Proc
 	procLINRemoveClient *syscall.Proc
@@ -107,25 +108,60 @@ var (
 )
 
 var (
-	InitErr  error
 	initOnce sync.Once
+	InitErr  error
+	plinDLL  *syscall.DLL
 )
 
+func initDLL() error {
+	initOnce.Do(func() {
 
+		plinDLL, InitErr = syscall.LoadDLL("PLinApi.dll")
+		if InitErr != nil {
+			InitErr = fmt.Errorf("failed to load PLinApi.dll: %w", InitErr)
+			return
+		}
 
-func init() {
-	var err error
-	plin, err = syscall.LoadDLL("PLinApi.dll")
-	if err != nil {
-		log.Println(err)
-		return
+		for name, proc := range funcMap {
+
+			p, err := findProcWithStdcall(plinDLL, name)
+			if err != nil {
+				InitErr = err
+				return
+			}
+
+			*proc = p
+		}
+	})
+
+	return InitErr
+}
+
+func findProcWithStdcall(dll *syscall.DLL, name string) (*syscall.Proc, error) {
+
+	// Try undecorated first
+	if p, err := dll.FindProc(name); err == nil {
+		return p, nil
 	}
 
-	for name, proc := range funcMap {
-		*proc, err = plin.FindProc(name)
-		if err != nil {
-			panic(err)
+	// Try stdcall decorations (common stack sizes)
+	for _, suffix := range []int{
+		4, 8, 12, 16, 20, 24, 28, 32,
+		36, 40, 44, 48, 52, 56, 60, 64,
+	} {
+		decorated := fmt.Sprintf("%s@%d", name, suffix)
+
+		if p, err := dll.FindProc(decorated); err == nil {
+			return p, nil
 		}
+	}
+
+	return nil, fmt.Errorf("PLIN procedure not found: %s", name)
+}
+
+func ensureInit() {
+	if err := initDLL(); err != nil {
+		panic(err)
 	}
 }
 
@@ -134,7 +170,22 @@ type PLINError struct {
 }
 
 func (e PLINError) Error() string {
-	return GetErrorText(e.Code)
+	const errBufSize = 256
+	buf := make([]byte, errBufSize)
+
+	LIN_GetErrorText(
+		e.Code,
+		0,
+		&buf[0], // already *byte
+		WORD(len(buf)),
+	)
+
+	n := bytes.IndexByte(buf, 0)
+	if n == -1 {
+		n = len(buf)
+	}
+
+	return string(buf[:n])
 }
 
 func checkErr(r1, _ uintptr, _ error) error {
@@ -171,14 +222,18 @@ func checkErr(r1, _ uintptr, _ error) error {
             A LIN Error Code
 */
 
-func LIN_RegisterClient(strName string, hWnd HLINHW, hClient HLINCLIENT) error {
+func LIN_RegisterClient(strName string, hWnd HLINHW, hClient *HLINCLIENT) error {
+	//ensureInit()
 	namePtr, err := syscall.BytePtrFromString(strName)
 	if err != nil {
-        return 0, err
+        return err
     }
 
-	return checkErr(procLINRegisterClient.Call(uintptr(unsafe.Pointer(strName)), uintptr(hWnd), uintptr(hClient)))
-} 
+	return checkErr(procLINRegisterClient.Call(
+		uintptr(unsafe.Pointer(namePtr)), 
+		uintptr(hWnd), 
+		uintptr(unsafe.Pointer(hClient))))
+}
 
 /*
 	Removes a Client from the Client list of the LIN Manager. 
@@ -204,8 +259,9 @@ func LIN_RegisterClient(strName string, hWnd HLINHW, hClient HLINCLIENT) error {
 		A LIN Error Code
 */
 
-func LIN_RemoveClient(hClient HLINCLIENT) error {
-	return checkErr(procLINRemoveClient.Call(uintptr(hClient)))
+func LIN_RemoveClient(hClient *HLINCLIENT) error {
+	return checkErr(procLINRemoveClient.Call(
+		uintptr(unsafe.Pointer(hClient))))
 } 
 
 /*
@@ -229,8 +285,10 @@ func LIN_RemoveClient(hClient HLINCLIENT) error {
 		A LIN Error Code
 */
 
-func LIN_ConnectClient(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINConnectClient.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_ConnectClient(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINConnectClient.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw)))
 } 
 
 /*
@@ -255,11 +313,12 @@ func LIN_ConnectClient(hClient HLINCLIENT, hHw HLINHW) error {
 	Returns:
 		A LIN Error Code
 */
-
-
-func LIN_DisconnectClient(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINDisconnectClient.Call(uintptr(hClient), uintptr(hHw)))
-} 
+func LIN_DisconnectClient(hclient HLINCLIENT, hw HLINHW) error {
+	return checkErr(procLINDisconnectClient.Call(
+		uintptr(hclient),
+		uintptr(hw),
+	))
+}
 
 /*
 	Flushes the Receive Queue of the Client and resets its counters.
@@ -282,8 +341,9 @@ func LIN_DisconnectClient(hClient HLINCLIENT, hHw HLINHW) error {
 		A LIN Error Code
 */
 
-func LIN_ResetClient(hClient HLINCLIENT) error {
-	return checkErr(procLINResetClient.Call(uintptr(hClient)))
+func LIN_ResetClient(hClient *HLINCLIENT) error {
+	return checkErr(procLINResetClient.Call(
+		uintptr(unsafe.Pointer(hClient))))
 } 
 
 /*
@@ -314,8 +374,11 @@ func LIN_ResetClient(hClient HLINCLIENT) error {
 		A LIN Error Code
 */
 
-func LIN_SetClientParam(hClient HLINCLIENT, wParam TLINClientParam, dwValue BYTE) error {
-	return checkErr(procLINSetClientParam.Call(uintptr(hClient), uintptr(wParam), uintptr(dwValue)))
+func LIN_SetClientParam(hClient *HLINCLIENT, wParam TLINClientParam, dwValue BYTE) error {
+	return checkErr(procLINSetClientParam.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(wParam), 
+		uintptr(dwValue)))
 } 
 
 /*
@@ -355,8 +418,12 @@ func LIN_SetClientParam(hClient HLINCLIENT, wParam TLINClientParam, dwValue BYTE
 		A LIN Error Code
 */
 			
-func LIN_GetClientParam(hClient HLINCLIENT, wParam TLINClientParam, pBuff *BYTE, wBuffSize WORD) error {
-	return checkErr(procLINGetClientParam.Call(uintptr(hClient), uintptr(wParam), intptr(unsafe.Pointer(pBuff)), uintptr(wBuffSize)))
+func LIN_GetClientParam(hClient *HLINCLIENT, wParam TLINClientParam, pBuff *BYTE, wBuffSize WORD) error {
+	return checkErr(procLINGetClientParam.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(wParam), 
+		uintptr(unsafe.Pointer(pBuff)), 
+		uintptr(wBuffSize)))
 } 
 
 /*
@@ -380,33 +447,14 @@ func LIN_GetClientParam(hClient HLINCLIENT, wParam TLINClientParam, pBuff *BYTE,
 		A LIN Error Code
 */
 
-func LIN_SetClientFilter(hClient HLINCLIENT, hHw HLINHW, iRcvMask *UINT64) error {
-	return checkErr(procLINSetClientFilter.Call(uintptr(hClient), uintptr(hHw), intptr(unsafe.Pointer(iRcvMask))))
-}   
-/*
-	Gets the filter corresponding to a given Client-Hardware pair.
-
-	Possible DLL interaction errors:
-		TLIN_ERROR_MANAGER_NOT_LOADED,
-		TLIN_ERROR_MANAGER_NOT_RESPONDING,
-		TLIN_ERROR_MEMORY_ACCESS
-
-	Possible API errors:
-		TLIN_ERROR_WRONG_PARAM_VALUE, TLIN_ERROR_ILLEGAL_CLIENT, 
-		TLIN_ERROR_ILLEGAL_HARDWARE
-
-	Parameters:
-		hClient     : Handle of the Client  (HLINCLIENT) 
-		hHw         : Handle of the Hardware (HLINHW)
-		pRcvMask    : Filter buffer. Each bit corresponds to a Frame ID (0..63) (c_uint64)
-
-	Returns:
-		A LIN Error Code
-*/
      
-func LIN_GetClientFilter(hClient HLINCLIENT, hHw HLINHW, pRcvMask *UINT64) error {
-	return checkErr(procLINGetClientFilter.Call(uintptr(hClient), uintptr(hHw), intptr(unsafe.Pointer(pRcvMask))))
-}    
+func LIN_SetClientFilter(hclient HLINCLIENT, hw HLINHW, iRcvMask UINT64) error {
+	return checkErr(procLINSetClientFilter.Call(
+		uintptr(hclient),
+		uintptr(hw),
+		uintptr(iRcvMask),
+	))
+}
 
 /*
 	Reads the next message/status information from a Client's Receive Queue.
@@ -431,8 +479,11 @@ func LIN_GetClientFilter(hClient HLINCLIENT, hHw HLINHW, pRcvMask *UINT64) error
 		A LIN Error Code
 */  
 
-func LIN_Read(hClient HLINCLIENT, pMsg *TLINRcvMsg) error {
-	return checkErr(procLINRead.Call(uintptr(hClient),  intptr(unsafe.Pointer(pMsg))))
+func LIN_Read(hclient HLINCLIENT, msg *TLINRcvMsg) error {
+	return checkErr(procLINRead.Call(
+		uintptr(hclient),
+		uintptr(unsafe.Pointer(msg)),
+	))
 }
 /*
 	Reads several received messages.
@@ -462,8 +513,12 @@ func LIN_Read(hClient HLINCLIENT, pMsg *TLINRcvMsg) error {
 		A LIN Error Code
 */
 
-func LIN_ReadMulti(hClient HLINCLIENT, pMsgBuff *TLINRcvMsg, iMaxCount SDWORD, pCount *SDWORD) error {
-	return checkErr(procLINReadMulti.Call(uintptr(hClient),  intptr(unsafe.Pointer(pMsgBuff)), uintptr(iMaxCount), intptr(unsafe.Pointer(pCount))))
+func LIN_ReadMulti(hClient *HLINCLIENT, pMsgBuff []TLINRcvMsg, iMaxCount SDWORD, pCount *SDWORD) error {
+	return checkErr(procLINReadMulti.Call(
+		uintptr(unsafe.Pointer(hClient)),  
+		uintptr(unsafe.Pointer(&pMsgBuff[0])), 
+		uintptr(iMaxCount), 
+		uintptr(unsafe.Pointer(pCount))))
 }
 
 /*
@@ -491,8 +546,11 @@ func LIN_ReadMulti(hClient HLINCLIENT, pMsgBuff *TLINRcvMsg, iMaxCount SDWORD, p
 		A LIN Error Code
 */
    
-func LIN_Write(hClient HLINCLIENT, hHw HLINHW, pMsg *TLINMsg) error {
-	return checkErr(procLINWrite.Call(uintptr(hClient), uintptr(hHw), intptr(unsafe.Pointer(pMsg))))
+func LIN_Write(hClient *HLINCLIENT, hHw HLINHW, pMsg *TLINMsg) error {
+	return checkErr(procLINWrite.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(unsafe.Pointer(pMsg))))
 }
 
 /*
@@ -523,8 +581,12 @@ func LIN_Write(hClient HLINCLIENT, hHw HLINHW, pMsg *TLINMsg) error {
 		A LIN Error Code
 */
 
-func LIN_InitializeHardware(hClient HLINCLIENT, hHw HLINHW, byMode WORD, wBaudrate WORD) error {
-	return checkErr(procLINInitializeHardware.Call(uintptr(hClient), uintptr(hHw), uintptr(byMode), uintptr(wBaudrate)))
+func LIN_InitializeHardware(hClient *HLINCLIENT, hHw HLINHW, byMode WORD, wBaudrate WORD) error {
+	return checkErr(procLINInitializeHardware.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(byMode), 
+		uintptr(wBaudrate)))
 }
 
 /*
@@ -552,8 +614,13 @@ func LIN_InitializeHardware(hClient HLINCLIENT, hHw HLINHW, byMode WORD, wBaudra
 		A LIN Error Code
 */ 
 
-func LIN_GetAvailableHardware(pBuff *HLINHW, wBuffSize WORD, pCount *WORD) error {
-	return checkErr(procLINGetAvailableHardware.Call(intptr(unsafe.Pointer(pBuff)), uintptr(wBuffSize), intptr(unsafe.Pointer(pCount))))
+func LIN_GetAvailableHardware(pBuff []HLINHW, wBuffSize WORD, pCount *WORD) error {
+	ensureInit()
+
+	return checkErr(procLINGetAvailableHardware.Call(
+		uintptr(unsafe.Pointer(&pBuff[0])), 
+		uintptr(wBuffSize), 
+		uintptr(unsafe.Pointer(pCount))))
 }
 
 /*
@@ -588,8 +655,14 @@ func LIN_GetAvailableHardware(pBuff *HLINHW, wBuffSize WORD, pCount *WORD) error
 	Returns:
 		A LIN Error Code
 */    
-func LIN_SetHardwareParam(hClient HLINCLIENT, hHw HLINHW, wParam TLINHardwareParam, pBuff *BYTE, wBuffSize WORD) error {
-	return checkErr(procLINSetHardwareParam.Call(uintptr(hClient), uintptr(hHw), uintptr(wParam), intptr(unsafe.Pointer(pBuff)), uintptr(wParam)))
+func LIN_SetHardwareParam(hClient *HLINCLIENT, hHw HLINHW, wParam TLINHardwareParam, pBuff *BYTE, wBuffSize WORD) error {
+	return checkErr(procLINSetHardwareParam.Call(
+		uintptr(unsafe.Pointer(hClient)),
+		uintptr(hHw),
+		uintptr(wParam),
+		uintptr(unsafe.Pointer(pBuff)),
+		uintptr(wBuffSize),
+	))
 }
 
 /*
@@ -639,7 +712,11 @@ func LIN_SetHardwareParam(hClient HLINCLIENT, hHw HLINHW, wParam TLINHardwarePar
 */
 
 func LIN_GetHardwareParam(hHw HLINHW, wParam TLINHardwareParam, pBuff *BYTE, wBuffSize WORD) error {
-	return checkErr(procLINGetHardwareParam.Call(uintptr(hHw), uintptr(wParam), intptr(unsafe.Pointer(pBuff)), uintptr(wParam)))
+	return checkErr(procLINGetHardwareParam.Call(
+		uintptr(hHw),
+		uintptr(wParam), 
+		uintptr(unsafe.Pointer(pBuff)), 
+		uintptr(wBuffSize)))
 }
 
 /*
@@ -662,8 +739,10 @@ func LIN_GetHardwareParam(hHw HLINHW, wParam TLINHardwareParam, pBuff *BYTE, wBu
 		A LIN Error Code
 */    
 
-func LIN_ResetHardware(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINResetHardware.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_ResetHardware(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINResetHardware.Call(
+		uintptr(unsafe.Pointer(hClient)),
+		uintptr(hHw)))
 }			
 
 /*
@@ -688,8 +767,10 @@ func LIN_ResetHardware(hClient HLINCLIENT, hHw HLINHW) error {
 		A LIN Error Code
 */  
 
-func LIN_ResetHardwareConfig(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINResetHardwareConfig.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_ResetHardwareConfig(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINResetHardwareConfig.Call(
+		uintptr(unsafe.Pointer(hClient)),
+		uintptr(hHw)))
 }	
 
 /*
@@ -712,7 +793,8 @@ func LIN_ResetHardwareConfig(hClient HLINCLIENT, hHw HLINHW) error {
 */  
 
 func LIN_IdentifyHardware(hHw HLINHW) error {
-	return checkErr(procLINIdentifyHardware.Call(uintptr(hHw)))
+	return checkErr(procLINIdentifyHardware.Call(
+		uintptr(hHw)))
 }			
 
 
@@ -740,8 +822,12 @@ func LIN_IdentifyHardware(hHw HLINHW) error {
 		A LIN Error Code
 */    
 
-func LIN_RegisterFrameId(hClient HLINCLIENT, hHw HLINHW, bFromFrameId UINT64, bToFrameId UINT64) error {
-	return checkErr(procLINRegisterFrameId.Call(uintptr(hClient), uintptr(hHw), uintptr(bFromFrameId), uintptr(bToFrameId)))
+func LIN_RegisterFrameId(hClient *HLINCLIENT, hHw HLINHW, bFromFrameId BYTE, bToFrameId BYTE) error {
+	return checkErr(procLINRegisterFrameId.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(bFromFrameId), 
+		uintptr(bToFrameId)))
 }
 
 /*
@@ -767,8 +853,11 @@ func LIN_RegisterFrameId(hClient HLINCLIENT, hHw HLINHW, bFromFrameId UINT64, bT
 		A LIN Error Code
 */   
 
-func LIN_SetFrameEntry(hClient HLINCLIENT, hHw HLINHW, pFrameEntry *TLINFrameEntry) error {
-	return checkErr(procLINSetFrameEntry.Call(uintptr(hClient), uintptr(hHw), intptr(unsafe.Pointer(pFrameEntry))))
+func LIN_SetFrameEntry(hClient *HLINCLIENT, hHw HLINHW, pFrameEntry *TLINFrameEntry) error {
+	return checkErr(procLINSetFrameEntry.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(unsafe.Pointer(pFrameEntry))))
 }    
 
 /*
@@ -798,7 +887,9 @@ func LIN_SetFrameEntry(hClient HLINCLIENT, hHw HLINHW, pFrameEntry *TLINFrameEnt
 */
 
 func LIN_GetFrameEntry(hHw HLINHW, pFrameEntry *TLINFrameEntry) error {
-	return checkErr(procLINGetFrameEntry.Call(uintptr(hHw), intptr(unsafe.Pointer(pFrameEntry))))
+	return checkErr(procLINGetFrameEntry.Call(
+		uintptr(hHw), 
+		uintptr(unsafe.Pointer(pFrameEntry))))
 }
     
 /*
@@ -829,8 +920,14 @@ func LIN_GetFrameEntry(hHw HLINHW, pFrameEntry *TLINFrameEntry) error {
 		A LIN Error Code
 */
 
-func LIN_UpdateByteArray(hClient HLINCLIENT, hHw HLINHW, bFrameId UINT64, bIndex UINT64, bLen UINT64, pData *UINT64) error {
-	return checkErr(procLINUpdateByteArray.Call(uintptr(hClient), uintptr(hHw), uintptr(bFrameId), uintptr(bIndex), uintptr(bLen), intptr(unsafe.Pointer(pData))))
+func LIN_UpdateByteArray(hClient *HLINCLIENT, hHw HLINHW, bFrameId BYTE, bIndex BYTE, bLen BYTE, pData *BYTE) error {
+	return checkErr(procLINUpdateByteArray.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(bFrameId), 
+		uintptr(bIndex), 
+		uintptr(bLen), 
+		uintptr(unsafe.Pointer(pData))))
 }
 
 /*
@@ -857,8 +954,12 @@ func LIN_UpdateByteArray(hClient HLINCLIENT, hHw HLINHW, bFrameId UINT64, bIndex
 	Returns:
 		A LIN Error Code
 */    
-func LIN_StartKeepAlive(hClient HLINCLIENT, hHw HLINHW, bFrameId UINT64, wPeriod WORD) error {
-	return checkErr(procLINStartKeepAlive.Call(uintptr(hClient), uintptr(hHw),uintptr(bFrameId), uintptr(wPeriod)))
+func LIN_StartKeepAlive(hClient *HLINCLIENT, hHw HLINHW, bFrameId BYTE, wPeriod WORD) error {
+	return checkErr(procLINStartKeepAlive.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw),
+		uintptr(bFrameId), 
+		uintptr(wPeriod)))
 }
 
 /*
@@ -883,8 +984,10 @@ func LIN_StartKeepAlive(hClient HLINCLIENT, hHw HLINHW, bFrameId UINT64, wPeriod
 		A LIN Error Code
 */
 			
-func LIN_SuspendKeepAlive(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINSuspendKeepAlive.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_SuspendKeepAlive(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINSuspendKeepAlive.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw)))
 }
 
 /*
@@ -910,8 +1013,10 @@ func LIN_SuspendKeepAlive(hClient HLINCLIENT, hHw HLINHW) error {
 		A LIN Error Code
 */
 
-func LIN_ResumeKeepAlive(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINResumeKeepAlive.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_ResumeKeepAlive(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINResumeKeepAlive.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw)))
 }
 
 /*
@@ -946,8 +1051,13 @@ func LIN_ResumeKeepAlive(hClient HLINCLIENT, hHw HLINHW) error {
 		A LIN Error Code
 */
 
-func LIN_SetSchedule(hClient HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD, pSchedule *TLINScheduleSlot, iSlotCount SDWORD) error {
-	return checkErr(procLINSetSchedule.Call(uintptr(hClient), uintptr(hHw), uintptr(iScheduleNumber), intptr(unsafe.Pointer(pSchedule)), uintptr(iSlotCount)))
+func LIN_SetSchedule(hClient *HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD, pSchedule *TLINScheduleSlot, iSlotCount SDWORD) error {
+	return checkErr(procLINSetSchedule.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(iScheduleNumber), 
+		uintptr(unsafe.Pointer(pSchedule)), 
+		uintptr(iSlotCount)))
 }
 
 /*
@@ -977,7 +1087,12 @@ func LIN_SetSchedule(hClient HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD, pSc
 */
 
 func LIN_GetSchedule(hHw HLINHW, iScheduleNumber SDWORD, pScheduleBuff *TLINScheduleSlot, iMaxSlotCount SDWORD, pSlotCount *SDWORD) error {
-	return checkErr(procLINGetSchedule.Call(uintptr(hHw), uintptr(iScheduleNumber), intptr(unsafe.Pointer(pScheduleBuff)), uintptr(iMaxSlotCount), intptr(unsafe.Pointer(pSlotCount))))
+	return checkErr(procLINGetSchedule.Call(
+		uintptr(hHw), 
+		uintptr(iScheduleNumber), 
+		uintptr(unsafe.Pointer(pScheduleBuff)), 
+		uintptr(iMaxSlotCount), 
+		uintptr(unsafe.Pointer(pSlotCount))))
 }
 
 /*
@@ -1006,8 +1121,11 @@ func LIN_GetSchedule(hHw HLINHW, iScheduleNumber SDWORD, pScheduleBuff *TLINSche
 		A LIN Error Code
 */
 
-func LIN_DeleteSchedule(hClient HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD) error {
-	return checkErr(procLINDeleteSchedule.Call(uintptr(hClient), uintptr(hHw), uintptr(iScheduleNumber)))
+func LIN_DeleteSchedule(hClient *HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD) error {
+	return checkErr(procLINDeleteSchedule.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(iScheduleNumber)))
 }
 
 
@@ -1035,8 +1153,12 @@ func LIN_DeleteSchedule(hClient HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD) 
 		A LIN Error Code
 */
 
-func LIN_SetScheduleBreakPoint(hClient HLINCLIENT, hHw HLINHW, iBreakPointNumber SDWORD, dwHandle DWORD) error {
-	return checkErr(procLINSetScheduleBreakPoint.Call(uintptr(hClient), uintptr(hHw), uintptr(iBreakPointNumber), uintptr(dwHandle)))
+func LIN_SetScheduleBreakPoint(hClient *HLINCLIENT, hHw HLINHW, iBreakPointNumber SDWORD, dwHandle DWORD) error {
+	return checkErr(procLINSetScheduleBreakPoint.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(iBreakPointNumber), 
+		uintptr(dwHandle)))
 }			
 
 /*
@@ -1065,8 +1187,11 @@ func LIN_SetScheduleBreakPoint(hClient HLINCLIENT, hHw HLINHW, iBreakPointNumber
 		A LIN Error Code
 */
 
-func LIN_StartSchedule(hClient HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD) error {
-	return checkErr(procLINStartSchedule.Call(uintptr(hClient), uintptr(hHw), uintptr(iScheduleNumber)))
+func LIN_StartSchedule(hClient *HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD) error {
+	return checkErr(procLINStartSchedule.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(iScheduleNumber)))
 }
 
 /*
@@ -1090,8 +1215,10 @@ func LIN_StartSchedule(hClient HLINCLIENT, hHw HLINHW, iScheduleNumber SDWORD) e
 		A LIN Error Code
 */
 
-func LIN_SuspendSchedule(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINSuspendSchedule.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_SuspendSchedule(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINSuspendSchedule.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw)))
 }
 
 /*
@@ -1117,8 +1244,10 @@ func LIN_SuspendSchedule(hClient HLINCLIENT, hHw HLINHW) error {
 		A LIN Error Code
 */
 
-func LIN_ResumeSchedule(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINResumeSchedule.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_ResumeSchedule(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINResumeSchedule.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw)))
 }
 
 /*
@@ -1146,8 +1275,10 @@ func LIN_ResumeSchedule(hClient HLINCLIENT, hHw HLINHW) error {
 		A LIN Error Code
 */
 
-func LIN_XmtWakeUp(hClient HLINCLIENT, hHw HLINHW) error {
-	return checkErr(procLINXmtWakeUp.Call(uintptr(hClient), uintptr(hHw)))
+func LIN_XmtWakeUp(hClient *HLINCLIENT, hHw HLINHW) error {
+	return checkErr(procLINXmtWakeUp.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw)))
 }
 
 /*
@@ -1176,8 +1307,11 @@ func LIN_XmtWakeUp(hClient HLINCLIENT, hHw HLINHW) error {
 		A LIN Error Code
 */
 
-func LIN_XmtDynamicWakeUp(hClient HLINCLIENT, hHw HLINHW, sTimeOut WORD) error {
-	return checkErr(procLINXmtDynamicWakeUp.Call(uintptr(hClient), uintptr(hHw), uintptr(sTimeOut)))
+func LIN_XmtDynamicWakeUp(hClient *HLINCLIENT, hHw HLINHW, sTimeOut WORD) error {
+	return checkErr(procLINXmtDynamicWakeUp.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(sTimeOut)))
 }
 
 /*
@@ -1205,8 +1339,11 @@ func LIN_XmtDynamicWakeUp(hClient HLINCLIENT, hHw HLINHW, sTimeOut WORD) error {
 		A LIN Error Code
 */
 
-func LIN_StartAutoBaud(hClient HLINCLIENT, hHw HLINHW, wTimeOut WORD) error {
-	return checkErr(procLINStartAutoBaud.Call(uintptr(hClient), uintptr(hHw), uintptr(wTimeOut)))
+func LIN_StartAutoBaud(hClient *HLINCLIENT, hHw HLINHW, wTimeOut WORD) error {
+	return checkErr(procLINStartAutoBaud.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(wTimeOut)))
 }
 
 /*
@@ -1228,7 +1365,9 @@ func LIN_StartAutoBaud(hClient HLINCLIENT, hHw HLINHW, wTimeOut WORD) error {
 		A LIN Error Code
 */
 func LIN_GetStatus(hHw HLINHW, pStatusBuff *TLINHardwareStatus) error {
-	return checkErr(procLINGetStatus.Call(uintptr(hHw), intptr(unsafe.Pointer(pStatusBuff))))
+	return checkErr(procLINGetStatus.Call(
+		uintptr(hHw), 
+		uintptr(unsafe.Pointer(pStatusBuff))))
 }
 
 /*
@@ -1251,7 +1390,8 @@ func LIN_GetStatus(hHw HLINHW, pStatusBuff *TLINHardwareStatus) error {
 */
 
 func LIN_CalculateChecksum(pMsg *TLINMsg) error {
-	return checkErr(procLINCalculateChecksum.Call(intptr(unsafe.Pointer(pMsg))))
+	return checkErr(procLINCalculateChecksum.Call(
+		uintptr(unsafe.Pointer(pMsg))))
 }
 
 /*
@@ -1273,7 +1413,8 @@ func LIN_CalculateChecksum(pMsg *TLINMsg) error {
 */
 
 func LIN_GetVersion(pVerBuffer *TLINVersion) error {
-	return checkErr(procLINGetVersion.Call(intptr(unsafe.Pointer(pVerBuffer))))
+	return checkErr(procLINGetVersion.Call(
+		uintptr(unsafe.Pointer(pVerBuffer))))
 }
 
 /*
@@ -1295,8 +1436,12 @@ func LIN_GetVersion(pVerBuffer *TLINVersion) error {
 		A LIN Error Code
 */
 
-func LIN_GetVersionInfo(pTextBuff LPSTR, wBuffSize *UINT64) error {
-	return checkErr(procLINGetVersionInfo.Call(uintptr(dwError), intptr(unsafe.Pointer(pRemapTab))))
+func LIN_GetVersionInfo(pTextBuff LPSTR, wBuffSize WORD) error {
+	ensureInit()
+
+	return checkErr(procLINGetVersionInfo.Call(
+		uintptr(unsafe.Pointer(pTextBuff)),
+		uintptr(wBuffSize)))
 }
 //////////////////////////
 /*
@@ -1321,8 +1466,14 @@ func LIN_GetVersionInfo(pTextBuff LPSTR, wBuffSize *UINT64) error {
 		A LIN Error Code
 */
 
-func LIN_GetErrorText(dwError TLINError, bLanguage *BYTE, strTextBuff LPSTR, wBuffSize *UINT64) error {
-	return checkErr(procLINGetErrorText.Call(uintptr(dwError), uintptr(hHw), uintptr(unsafe.Pointer(pRemapTab))))
+func LIN_GetErrorText(dwError TLINError, bLanguage BYTE, strTextBuff LPSTR, wBuffSize WORD) error {
+	ensureInit()
+
+	return checkErr(procLINGetErrorText.Call(
+		uintptr(dwError), 
+		uintptr(bLanguage), 
+		uintptr(unsafe.Pointer(strTextBuff)), 
+		uintptr(wBuffSize)))
 }
 
 /*
@@ -1343,8 +1494,17 @@ func LIN_GetErrorText(dwError TLINError, bLanguage *BYTE, strTextBuff LPSTR, wBu
 	Returns:
 		A LIN Error Code
 */
-func LIN_GetPID(pframeid *UINT64) error {
-	return checkErr(procLINGetPID.Call(uintptr(unsafe.Pointer(pframeid))))
+/*func LIN_GetPID(pframeid *BYTE) error {
+	return checkErr(procLINGetPID.Call(
+		uintptr(unsafe.Pointer(pframeid))))
+}*/
+func LIN_GetPID(pid *BYTE) error {
+
+	ensureInit()
+
+	return checkErr(procLINGetPID.Call(
+		uintptr(unsafe.Pointer(pid)),
+	))
 }
 
 /*
@@ -1367,7 +1527,9 @@ func LIN_GetPID(pframeid *UINT64) error {
 */
 
 func LIN_GetTargetTime(hHw HLINHW, pTargetTime *UINT64) error {
-	return checkErr(procLINGetTargetTime.Call(uintptr(hHw), uintptr(unsafe.Pointer(pTargetTime))))
+	return checkErr(procLINGetTargetTime.Call(
+		uintptr(hHw), 
+		uintptr(unsafe.Pointer(pTargetTime))))
 }
 
 /*
@@ -1392,8 +1554,11 @@ func LIN_GetTargetTime(hHw HLINHW, pTargetTime *UINT64) error {
 		A LIN Error Code
 */
 
-func LIN_SetResponseRemap(hClient HLINCLIENT, hHw HLINHW, pRemapTab *UINT64) error {
-	return checkErr(procLINSetResponseRemap.Call(uintptr(hClient), uintptr(hHw), uintptr(unsafe.Pointer(pRemapTab))))
+func LIN_SetResponseRemap(hClient *HLINCLIENT, hHw HLINHW, pRemapTab *[64]BYTE) error {
+	return checkErr(procLINSetResponseRemap.Call(
+		uintptr(unsafe.Pointer(hClient)), 
+		uintptr(hHw), 
+		uintptr(unsafe.Pointer(pRemapTab))))
 }
 
 
@@ -1416,8 +1581,10 @@ func LIN_SetResponseRemap(hClient HLINCLIENT, hHw HLINHW, pRemapTab *UINT64) err
 	Returns:
 		A LIN Error Code
 */
-func LIN_GetResponseRemap(hHw HLINHW, pRemapTab *UINT64) error {
-	return checkErr(procLINGetResponseRemap.Call(uintptr(hHw), uintptr(unsafe.Pointer(pRemapTab))))
+func LIN_GetResponseRemap(hHw HLINHW, pRemapTab *[64]BYTE) error {
+	return checkErr(procLINGetResponseRemap.Call(
+		uintptr(hHw), 
+		uintptr(unsafe.Pointer(pRemapTab))))
 }
 
 /*
@@ -1438,7 +1605,8 @@ func LIN_GetResponseRemap(hHw HLINHW, pRemapTab *UINT64) error {
 */
 
 func LIN_GetSystemTime(pTargetTime *UINT64) error {
-	return checkErr(procLINGetSystemTime.Call(uintptr(unsafe.Pointer(pTargetTime))))
+	return checkErr(procLINGetSystemTime.Call(
+		uintptr(unsafe.Pointer(pTargetTime))))
 }
 
 
