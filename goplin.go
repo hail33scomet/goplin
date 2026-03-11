@@ -426,6 +426,14 @@ func LIN_GetClientParam(hClient *HLINCLIENT, wParam TLINClientParam, pBuff *BYTE
 		uintptr(wBuffSize)))
 } 
 
+func LIN_GetClientFilter(hclient HLINCLIENT, hw HLINHW, iRcvMask *UINT64) error {
+	return checkErr(procLINGetClientFilter.Call(
+		uintptr(hclient),
+		uintptr(hw),
+		uintptr(unsafe.Pointer(iRcvMask)),
+	))
+}
+
 /*
 	Sets the filter of a Client and modifies the filter of the connected Hardware.
 
@@ -448,11 +456,11 @@ func LIN_GetClientParam(hClient *HLINCLIENT, wParam TLINClientParam, pBuff *BYTE
 */
 
      
-func LIN_SetClientFilter(hclient HLINCLIENT, hw HLINHW, iRcvMask UINT64) error {
+func LIN_SetClientFilter(hclient HLINCLIENT, hw HLINHW, iRcvMask *UINT64) error {
 	return checkErr(procLINSetClientFilter.Call(
 		uintptr(hclient),
 		uintptr(hw),
-		uintptr(iRcvMask),
+		uintptr(unsafe.Pointer(iRcvMask)),
 	))
 }
 
